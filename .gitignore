@@ -1,0 +1,25 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binaries / coverage
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Vendored deps (we don't vendor; adapters resolve at build time)
+/vendor/
+
+# Editor / OS noise
+.idea/
+.vscode/
+.DS_Store
+*.swp
