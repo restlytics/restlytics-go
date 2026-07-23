@@ -73,8 +73,11 @@ func (t *Tracer) Start(ctx context.Context, name, traceparent string) context.Co
 	if tp, ok := ParseTraceparent(traceparent); ok {
 		st.traceID = tp.TraceID
 		rootParent = tp.ParentSpanID
-		// Respect an upstream "not sampled" decision; only re-roll if it was sampled.
-		st.sampled = st.enabled && tp.Sampled && sampleDecision(st.traceID, t.cfg.SampleRate)
+		// A continued trace inherits the upstream sampled flag EXACTLY — the
+		// decision belongs to the head of the chain. Re-rolling it locally would
+		// let this service drop a trace its caller kept, punching a hole in the
+		// middle of the distributed trace whenever SampleRate < 1.0.
+		st.sampled = st.enabled && tp.Sampled
 	} else {
 		st.traceID = NewTraceID()
 		st.sampled = st.enabled && sampleDecision(st.traceID, t.cfg.SampleRate)
