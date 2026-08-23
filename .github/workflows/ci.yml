@@ -23,6 +23,9 @@ jobs:
         go: ['1.21', '1.22', '1.23']
     steps:
       - uses: actions/checkout@v4
+      - uses: restlytics/sdk-conformance@v1.1.0
+        with:
+          fixture-path: testdata/conformance/v1
       - uses: actions/setup-go@v5
         with:
           go-version: ${{ matrix.go }}

@@ -110,11 +110,18 @@ db.Use(restlyticsgorm.New(rl, "postgresql"))
 
 - Bindings are **counted, never sent**. SQL is normalized to a literal-free
   `db.query.summary` (the N+1 grouping key).
-- Outbound `url.full` query strings are scrubbed; sensitive headers
-  (`authorization`, `cookie`, `x-api-key`, …) are never captured. No bodies.
+- Every outbound `url.full` query value is scrubbed; credentials/fragments, headers,
+  bodies, and exception content are never exported.
 - Per-request state is isolated via `context.Context` — no shared singleton, safe
   under concurrency.
 - The in-request buffer is capped (default 2000 spans).
+
+## Cross-language conformance
+
+CI pins [`restlytics/sdk-conformance@v1.1.0`](https://github.com/restlytics/sdk-conformance)
+and compares the vendored fixture before testing. The suite proves exact semantic OTLP output,
+W3C propagation, root sampling, source redaction, and error-status behavior shared by all seven SDKs.
+This is the wire-level gate; real net/http/Gin/Echo/Fiber application validation is tracked separately.
 
 ## License
 
