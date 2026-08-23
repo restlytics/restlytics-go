@@ -44,6 +44,11 @@ jobs:
           # No PR context on a manual run; fall back to the dispatched ref.
           ref: ${{ github.event.pull_request.base.ref || github.ref }}
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
       - name: Determine bump level
         id: bump
         env:
@@ -56,9 +61,9 @@ jobs:
           if [ "$EVENT" = workflow_dispatch ]; then
             # Manual run: the level comes from the dispatch input, not a PR label.
             level="$INPUT_LEVEL"
-          elif printf '%s' "$LABELS" | grep -q '"semver:major"'; then level=major
-          elif printf '%s' "$LABELS" | grep -q '"semver:minor"'; then level=minor
-          elif printf '%s' "$LABELS" | grep -q '"semver:patch"'; then level=patch
+          elif printf '%s' "$LABELS" | grep -q '"semver:major"'; then level="major"
+          elif printf '%s' "$LABELS" | grep -q '"semver:minor"'; then level="minor"
+          elif printf '%s' "$LABELS" | grep -q '"semver:patch"'; then level="patch"
           fi
           if [ -z "$level" ]; then
             echo "No semver:* label on the merged PR; skipping release."
@@ -97,6 +102,25 @@ jobs:
           set -euo pipefail
           # Go module versions come from git tags; bump the emitted SDK version constant.
           sed -i -E 's/(SDKVersion[[:space:]]*= ")[^"]*(")/\1'"$VERSION"'\2/' otlp.go
+
+      - name: Validate the release candidate and clean install
+        if: steps.bump.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          go mod download
+          go build ./...
+          go vet ./...
+          go test -race ./...
+
+          smoke_dir="$(mktemp -d)"
+          cd "${smoke_dir}"
+          go mod init restlytics-release-smoke
+          go mod edit -require=github.com/restlytics/restlytics-go@v0.0.0
+          go mod edit -replace=github.com/restlytics/restlytics-go="${GITHUB_WORKSPACE}"
+          printf 'package smoke\nimport _ "github.com/restlytics/restlytics-go"\n' > smoke_test.go
+          go mod tidy
+          go test ./...
+          cd "${GITHUB_WORKSPACE}"
 
       - name: Tag and release
         if: steps.bump.outputs.skip != 'true'
