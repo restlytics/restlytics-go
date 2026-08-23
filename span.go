@@ -1,6 +1,9 @@
 package restlytics
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // A single span, accumulated in-request and serialized to OTLP/JSON on flush.
 //
@@ -59,6 +62,9 @@ func (s *Span) SetEnd(end int64) *Span {
 }
 
 func (s *Span) setAttr(key string, v AnyValue) {
+	if IsSensitiveAttributeKey(key) {
+		return
+	}
 	if i, ok := s.index[key]; ok {
 		s.values[i] = v
 		return
@@ -70,6 +76,9 @@ func (s *Span) setAttr(key string, v AnyValue) {
 
 // SetString records a string attribute.
 func (s *Span) SetString(key, value string) *Span {
+	if strings.EqualFold(key, AttrURLFull) {
+		value = redactURL(value, nil)
+	}
 	s.setAttr(key, StringValue(value))
 	return s
 }
@@ -92,15 +101,11 @@ func (s *Span) SetBool(key string, value bool) *Span {
 	return s
 }
 
-// SetStatus sets the span status. The message is capped to keep payloads bounded.
-func (s *Span) SetStatus(code int, message string) *Span {
+// SetStatus sets the span status. Exception/error text is intentionally omitted;
+// Restlytics is a performance product, not a crash-content collector.
+func (s *Span) SetStatus(code int, _ string) *Span {
 	s.statusCode = code
-	if message != "" {
-		if len(message) > 1024 {
-			message = message[:1024]
-		}
-		s.statusMessage = message
-	}
+	s.statusMessage = ""
 	return s
 }
 

@@ -48,7 +48,7 @@ func finish(rl *restlytics.Restlytics, c *fiber.Ctx) {
 		return
 	}
 
-	route := c.Path()
+	route := "/*"
 	if r := c.Route(); r != nil && r.Path != "" {
 		route = r.Path // registered TEMPLATE ("/users/:id")
 	}

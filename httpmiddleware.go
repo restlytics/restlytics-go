@@ -12,7 +12,7 @@ import (
 //
 // http.route is set to the matched ServeMux pattern when available (Go 1.22+
 // exposes it via Request.Pattern); for plain mux usage without patterns it falls
-// back to the URL path. Framework adapters (Gin/Echo/Fiber) supply the real
+// back to a non-identifying wildcard. Framework adapters (Gin/Echo/Fiber) supply the real
 // route template via their own routing info.
 func (r *Restlytics) Middleware() func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -81,7 +81,8 @@ func (r *Restlytics) finishHTTP(ctx context.Context, req *http.Request, sw *stat
 //
 // The core net/http middleware has no portable access to the matched route
 // template at the Go 1.21 baseline (Request.Pattern arrived later), so it falls
-// back to the URL path. To emit a real low-cardinality template, either use a
+// back to a constant wildcard rather than a potentially identifying raw path.
+// To emit a real low-cardinality template, either use a
 // framework adapter (Gin/Echo/Fiber) or call WithRoute on the request context
 // from your handler. http.route is the #1 correctness rule — a raw URL here is a
 // last resort, not the intended steady state.
@@ -89,7 +90,7 @@ func httpRoute(req *http.Request) string {
 	if rt := routeFromContext(req.Context()); rt != "" {
 		return rt
 	}
-	return req.URL.Path
+	return "/*"
 }
 
 type statusWriter struct {

@@ -114,32 +114,52 @@ func IsSensitiveHeader(name string) bool {
 	return ok
 }
 
-// redactURL scrubs sensitive query-string keys from a raw URL, returning a
-// best-effort safe value for url.full. Unparseable input is returned unchanged
-// minus any query string, so we never leak values.
-func redactURL(raw string, keys []string) string {
+var sensitiveAttributeSegments = map[string]struct{}{
+	"authorization": {}, "auth": {}, "cookie": {}, "cookies": {},
+	"setcookie": {}, "password": {}, "passwd": {}, "secret": {},
+	"token": {}, "accesstoken": {}, "refreshtoken": {}, "apikey": {},
+	"credential": {}, "credentials": {}, "body": {}, "payload": {},
+	"form": {}, "stack": {}, "stacktrace": {}, "log": {},
+}
+
+// IsSensitiveAttributeKey is the fail-closed boundary for framework-specific
+// attributes. Content-bearing headers, bodies, logs, credentials and exception
+// fields never enter a span.
+func IsSensitiveAttributeKey(key string) bool {
+	normalized := strings.NewReplacer("-", ".", "_", ".").Replace(strings.ToLower(strings.TrimSpace(key)))
+	switch normalized {
+	case "http.request.method", "http.response.status.code", "restlytics.bindings.count":
+		return false
+	}
+	for _, segment := range strings.Split(normalized, ".") {
+		if _, sensitive := sensitiveAttributeSegments[segment]; sensitive {
+			return true
+		}
+	}
+	return false
+}
+
+// redactURL removes credentials/fragments and redacts every query value. keys is
+// retained for API compatibility; safety does not depend on guessing key names.
+func redactURL(raw string, _ []string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		// Strip anything after `?` defensively rather than risk leaking values.
-		if i := strings.IndexByte(raw, '?'); i >= 0 {
-			return raw[:i]
+		clean := strings.SplitN(strings.SplitN(raw, "#", 2)[0], "?", 2)[0]
+		if scheme := strings.Index(clean, "://"); scheme >= 0 {
+			prefix := clean[:scheme+3]
+			remainder := clean[scheme+3:]
+			if at := strings.LastIndex(remainder, "@"); at >= 0 {
+				return prefix + remainder[at+1:]
+			}
 		}
-		return raw
+		return clean
 	}
-	if u.RawQuery == "" {
-		return u.String()
-	}
-
-	deny := make(map[string]struct{}, len(keys))
-	for _, k := range keys {
-		deny[strings.ToLower(k)] = struct{}{}
-	}
+	u.User = nil
+	u.Fragment = ""
 
 	q := u.Query()
 	for k := range q {
-		if _, bad := deny[strings.ToLower(k)]; bad {
-			q.Set(k, "REDACTED")
-		}
+		q.Set(k, "REDACTED")
 	}
 	u.RawQuery = q.Encode()
 	return u.String()

@@ -46,11 +46,11 @@ func finish(rl *restlytics.Restlytics, c *gin.Context) {
 		return
 	}
 
-	// c.FullPath() is the matched route TEMPLATE ("/users/:id"); fall back to the
-	// path for unmatched routes (404).
+	// c.FullPath() is the matched route TEMPLATE ("/users/:id"); unmatched raw
+	// paths are never emitted because they may contain identifiers or tokens.
 	route := c.FullPath()
 	if route == "" {
-		route = c.Request.URL.Path
+		route = "/*"
 	}
 	method := c.Request.Method
 	status := c.Writer.Status()

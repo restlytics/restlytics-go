@@ -49,7 +49,7 @@ func finish(rl *restlytics.Restlytics, c echo.Context, handlerErr error) {
 	// c.Path() is the registered route TEMPLATE ("/users/:id").
 	route := c.Path()
 	if route == "" {
-		route = req.URL.Path
+		route = "/*"
 	}
 	method := req.Method
 	status := c.Response().Status
