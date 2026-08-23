@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,8 +22,21 @@ type Transport interface {
 	Send(payload ExportTraceServiceRequest)
 }
 
-// HTTPTransport gzips the JSON body and POSTs it with net/http, off the request
-// path in a background goroutine.
+// TransportDiagnostics is a payload-free snapshot suitable for health checks and
+// shutdown logs. Counts are process-local and monotonic.
+type TransportDiagnostics struct {
+	AcceptedBatches  int64
+	DeliveredBatches int64
+	DroppedBatches   int64
+	FailedBatches    int64
+	QueuedBatches    int
+	InFlightBatches  int64
+	QueueCapacity    int
+	Closed           bool
+}
+
+// HTTPTransport gzips the JSON body and POSTs it with net/http using one worker
+// goroutine and a bounded queue off the request path.
 //
 // Wire format (must match the ingestion contract exactly):
 //
@@ -33,66 +48,162 @@ type Transport interface {
 //
 // Every error path is swallowed — telemetry must never hurt the host app.
 type HTTPTransport struct {
-	url    string
-	key    string
-	client *http.Client
+	url       string
+	key       string
+	client    *http.Client
+	queue     chan ExportTraceServiceRequest
+	done      chan struct{}
+	stopped   chan struct{}
+	acceptMu  sync.Mutex
+	stopOnce  sync.Once
+	closed    atomic.Bool
+	pending   atomic.Int64
+	inFlight  atomic.Int64
+	accepted  atomic.Int64
+	delivered atomic.Int64
+	dropped   atomic.Int64
+	failed    atomic.Int64
 }
 
 // NewHTTPTransport builds an HTTPTransport. timeout bounds the whole send
 // (~2s by the contract); a zero/negative timeout falls back to 2s.
 func NewHTTPTransport(ingestURL, key string, timeout time.Duration) *HTTPTransport {
+	return newHTTPTransport(ingestURL, key, timeout, 64)
+}
+
+func newHTTPTransport(ingestURL, key string, timeout time.Duration, queueCapacity int) *HTTPTransport {
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
+	if queueCapacity <= 0 {
+		queueCapacity = 64
+	}
 	url := strings.TrimRight(ingestURL, "/") + "/v1/traces"
-	return &HTTPTransport{
+	t := &HTTPTransport{
 		url: url,
 		key: key,
 		client: &http.Client{
 			Timeout: timeout,
 		},
+		queue:   make(chan ExportTraceServiceRequest, queueCapacity),
+		done:    make(chan struct{}),
+		stopped: make(chan struct{}),
 	}
+	go t.run()
+	return t
 }
 
-// Send fires the payload off in a background goroutine and returns immediately.
+// Send performs only a bounded non-blocking enqueue and returns immediately.
 func (t *HTTPTransport) Send(payload ExportTraceServiceRequest) {
-	if t.url == "" || t.key == "" {
+	t.acceptMu.Lock()
+	defer t.acceptMu.Unlock()
+	if t.closed.Load() || t.url == "" || t.key == "" {
+		t.dropped.Add(1)
 		return
 	}
 
-	go func() {
-		// Absolute backstop: nothing in the flush goroutine may ever propagate a
-		// panic and crash the host process.
-		defer func() {
-			_ = recover()
-		}()
+	t.pending.Add(1)
+	select {
+	case t.queue <- payload:
+		t.accepted.Add(1)
+	default:
+		t.pending.Add(-1)
+		t.dropped.Add(1)
+	}
+}
 
-		body, err := gzipJSON(payload)
-		if err != nil {
+// Diagnostics returns an atomic delivery-health snapshot without payload data.
+func (t *HTTPTransport) Diagnostics() TransportDiagnostics {
+	return TransportDiagnostics{
+		AcceptedBatches:  t.accepted.Load(),
+		DeliveredBatches: t.delivered.Load(),
+		DroppedBatches:   t.dropped.Load(),
+		FailedBatches:    t.failed.Load(),
+		QueuedBatches:    len(t.queue),
+		InFlightBatches:  t.inFlight.Load(),
+		QueueCapacity:    cap(t.queue),
+		Closed:           t.closed.Load(),
+	}
+}
+
+// Flush waits for already-accepted batches without accepting unbounded work.
+func (t *HTTPTransport) Flush(ctx context.Context) bool {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if t.pending.Load() == 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+// Shutdown stops new work, flushes accepted batches, and releases the worker.
+func (t *HTTPTransport) Shutdown(ctx context.Context) bool {
+	t.acceptMu.Lock()
+	t.closed.Store(true)
+	t.acceptMu.Unlock()
+	if !t.Flush(ctx) {
+		return false
+	}
+	t.stopOnce.Do(func() { close(t.done) })
+	select {
+	case <-t.stopped:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (t *HTTPTransport) run() {
+	defer close(t.stopped)
+	for {
+		select {
+		case payload := <-t.queue:
+			t.inFlight.Store(1)
+			if t.post(payload) {
+				t.delivered.Add(1)
+			} else {
+				t.failed.Add(1)
+			}
+			t.inFlight.Store(0)
+			t.pending.Add(-1)
+		case <-t.done:
 			return
 		}
+	}
+}
 
-		ctx, cancel := context.WithTimeout(context.Background(), t.client.Timeout)
-		defer cancel()
-
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(body))
-		if err != nil {
-			return
+func (t *HTTPTransport) post(payload ExportTraceServiceRequest) (delivered bool) {
+	defer func() {
+		if recover() != nil {
+			delivered = false
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Content-Encoding", "gzip")
-		req.Header.Set("X-Restlytics-Key", t.key)
-
-		resp, err := t.client.Do(req)
-		if err != nil {
-			// Degrade silently on timeout/connection errors — drop the batch.
-			return
-		}
-		// Drain + close so the connection can be reused; response body is ignored
-		// (any/no response is treated as success per the contract).
-		_, _ = io.Copy(io.Discard, resp.Body)
-		_ = resp.Body.Close()
 	}()
+	body, err := gzipJSON(payload)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), t.client.Timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("X-Restlytics-Key", t.key)
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return false
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	return true
 }
 
 func gzipJSON(payload ExportTraceServiceRequest) ([]byte, error) {

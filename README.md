@@ -38,6 +38,23 @@ Pass a `Config` to `Init`, or leave fields empty and configure via environment:
 | `RESTLYTICS_MAX_SPANS` | `2000` | Per-request child span cap |
 | `RESTLYTICS_INSTRUMENT_DB` / `_HTTP` / `_CACHE` | `true` | Per-instrument toggles |
 
+## Delivery reliability and shutdown
+
+`HTTPTransport` owns one worker goroutine and a fixed 64-batch channel. `Send`
+only attempts a non-blocking enqueue; saturation drops the new batch instead of
+blocking or spawning goroutines, and delivery is never retried. Use
+`Diagnostics()` for payload-free accepted/delivered/dropped/failed counters and
+shut down with a bounded context:
+
+```go
+health := transport.Diagnostics()
+log.Printf("restlytics drops=%d failures=%d", health.DroppedBatches, health.FailedBatches)
+
+ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+defer cancel()
+transport.Shutdown(ctx)
+```
+
 ```go
 rl := restlytics.Init(restlytics.Config{
     Key:         "rl_xxx",          // or RESTLYTICS_KEY
