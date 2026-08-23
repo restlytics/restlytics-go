@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -253,6 +254,88 @@ func (t LogTransport) Send(payload ExportTraceServiceRequest) {
 	log.Printf("restlytics: %s", raw)
 }
 
+// TelemetryPreview is a local-only description of the production-shaped batch.
+type TelemetryPreview struct {
+	Mode                   string                    `json:"mode"`
+	NetworkRequestMade     bool                      `json:"networkRequestMade"`
+	Signal                 string                    `json:"signal"`
+	ConfiguredSampleRate   float64                   `json:"configuredSampleRate"`
+	Sampled                bool                      `json:"sampled"`
+	SpanCount              int                       `json:"spanCount"`
+	JSONBytes              int                       `json:"jsonBytes"`
+	GzipBytes              int                       `json:"gzipBytes"`
+	RedactionPolicyApplied []string                  `json:"redactionPolicyApplied"`
+	Payload                ExportTraceServiceRequest `json:"payload"`
+}
+
+// PreviewTransport emits a structured report locally and never opens a socket.
+// It is safe for concurrent requests and is selected with
+// RESTLYTICS_TRANSPORT=preview.
+type PreviewTransport struct {
+	SampleRate float64
+	Writer     io.Writer
+	mu         sync.Mutex
+	Reports    []TelemetryPreview
+}
+
+// NewPreviewTransport creates a local-only preview transport.
+func NewPreviewTransport(sampleRate float64, writer io.Writer) *PreviewTransport {
+	return &PreviewTransport{SampleRate: sampleRate, Writer: writer}
+}
+
+// Send creates the report synchronously, swallowing every failure.
+func (t *PreviewTransport) Send(payload ExportTraceServiceRequest) {
+	defer func() { _ = recover() }()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	gzipped, err := gzipJSON(payload)
+	if err != nil {
+		return
+	}
+	spanCount := 0
+	for _, resource := range payload.ResourceSpans {
+		for _, scope := range resource.ScopeSpans {
+			spanCount += len(scope.Spans)
+		}
+	}
+	report := TelemetryPreview{
+		Mode:                 "preview",
+		NetworkRequestMade:   false,
+		Signal:               "traces",
+		ConfiguredSampleRate: t.SampleRate,
+		Sampled:              true,
+		SpanCount:            spanCount,
+		JSONBytes:            len(raw),
+		GzipBytes:            len(gzipped),
+		RedactionPolicyApplied: []string{
+			"url query values and URL credentials",
+			"sensitive headers and credentials",
+			"request and response bodies",
+			"exception messages and stack traces",
+			"SQL binding values",
+		},
+		Payload: payload,
+	}
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return
+	}
+	t.mu.Lock()
+	t.Reports = append(t.Reports, report)
+	if len(t.Reports) > 16 {
+		t.Reports = append([]TelemetryPreview(nil), t.Reports[len(t.Reports)-16:]...)
+	}
+	writer := t.Writer
+	if writer != nil {
+		_, _ = fmt.Fprintln(writer, string(encoded))
+	} else {
+		log.Printf("restlytics preview: %s", encoded)
+	}
+	t.mu.Unlock()
+}
+
 // transportFromConfig picks a Transport from a resolved Config.
 func transportFromConfig(c Config) Transport {
 	if c.CustomTransport != nil {
@@ -263,6 +346,8 @@ func transportFromConfig(c Config) Transport {
 		return NullTransport{}
 	case "log":
 		return LogTransport{}
+	case "preview":
+		return NewPreviewTransport(c.SampleRate, nil)
 	default: // "http", "curl", anything else
 		return NewHTTPTransport(c.IngestURL, c.Key, time.Duration(c.TimeoutMs)*time.Millisecond)
 	}

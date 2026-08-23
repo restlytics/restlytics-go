@@ -20,7 +20,7 @@ type Config struct {
 	Environment string
 	// SampleRate is the head-based trace-id-ratio sample rate (0.0–1.0).
 	SampleRate float64
-	// Transport selects the transport: "http"/"curl" (default), "null", "log".
+	// Transport selects the transport: "http"/"curl" (default), "preview", "null", "log".
 	Transport string
 	// TimeoutMs bounds the fire-and-forget send.
 	TimeoutMs int
@@ -117,7 +117,7 @@ func (c Config) Resolve() Config {
 
 // Enabled reports whether the SDK should actually emit traces.
 func (c Config) Enabled() bool {
-	return c.Key != ""
+	return c.Key != "" || strings.EqualFold(c.Transport, "preview")
 }
 
 func envOr(key, fallback string) string {

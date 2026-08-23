@@ -32,11 +32,17 @@ Pass a `Config` to `Init`, or leave fields empty and configure via environment:
 | `RESTLYTICS_SERVICE_NAME` | `go-app` | `service.name` resource attribute |
 | `RESTLYTICS_ENV` | `production` | `deployment.environment` |
 | `RESTLYTICS_SAMPLE_RATE` | `1.0` | Head-based trace-id-ratio sample rate |
-| `RESTLYTICS_TRANSPORT` | `http` | `http` / `null` / `log` |
+| `RESTLYTICS_TRANSPORT` | `http` | `http` / `preview` / `null` / `log` |
 | `RESTLYTICS_TIMEOUT_MS` | `2000` | Send timeout (ms) |
 | `RESTLYTICS_CAPTURE_SQL` | `false` | Send raw `db.query.text` (capped 2048) |
 | `RESTLYTICS_MAX_SPANS` | `2000` | Per-request child span cap |
 | `RESTLYTICS_INSTRUMENT_DB` / `_HTTP` / `_CACHE` | `true` | Per-instrument toggles |
+
+Before connecting production data, set `RESTLYTICS_TRANSPORT=preview` and drive
+one representative request. Preview mode needs no ingest key, never opens a
+socket, and writes a structured report with `networkRequestMade: false`, the
+post-redaction production payload, configured sampling rate, span count, and
+JSON/gzip byte sizes. Use `RESTLYTICS_SAMPLE_RATE=1` for a deterministic review.
 
 ## Delivery reliability and shutdown
 
