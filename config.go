@@ -13,7 +13,8 @@ type Config struct {
 	// Key is the project ingest key, sent as X-Restlytics-Key. When empty the
 	// SDK quietly disables itself.
 	Key string
-	// IngestURL is the base URL; the SDK POSTs to {IngestURL}/v1/traces.
+	// IngestURL is the base URL; the SDK POSTs to {IngestURL}/v1/traces and,
+	// when enabled, {IngestURL}/v1/logs.
 	IngestURL string
 	// ServiceName / Environment become resource attributes.
 	ServiceName string
@@ -28,6 +29,13 @@ type Config struct {
 	CaptureSQL bool
 	// MaxSpans caps the in-request child buffer.
 	MaxSpans int
+	// Logs enables native log export through the slog handler. It is deliberately
+	// opt-in because application logs can contain substantially more content than
+	// traces.
+	Logs bool
+	// LogsMinSeverity is the minimum OpenTelemetry severityNumber to export.
+	// Zero resolves to WARN (13).
+	LogsMinSeverity int
 
 	// Per-instrument toggles. nil pointer => default (on).
 	InstrumentDB    *bool
@@ -43,17 +51,21 @@ type Config struct {
 	// Transport lets callers inject a custom transport (e.g. in tests). When set
 	// it overrides the Transport string selection.
 	CustomTransport Transport
+	// CustomLogsTransport overrides log delivery. When omitted, a selected
+	// transport that implements LogsTransport is reused for both signals.
+	CustomLogsTransport LogsTransport
 }
 
 // Default values mirroring the Laravel reference config.
 const (
-	defaultIngestURL  = "https://ingest.restlytics.com"
-	defaultService    = "go-app"
-	defaultEnv        = "production"
-	defaultSampleRate = 1.0
-	defaultTransport  = "http"
-	defaultTimeoutMs  = 2000
-	defaultMaxSpans   = 2000
+	defaultIngestURL       = "https://ingest.restlytics.com"
+	defaultService         = "go-app"
+	defaultEnv             = "production"
+	defaultSampleRate      = 1.0
+	defaultTransport       = "http"
+	defaultTimeoutMs       = 2000
+	defaultMaxSpans        = 2000
+	defaultLogsMinSeverity = SeverityWarn
 )
 
 func defaultIgnorePaths() []string {
@@ -95,6 +107,18 @@ func (c Config) Resolve() Config {
 	}
 	if out.MaxSpans == 0 {
 		out.MaxSpans = envInt("RESTLYTICS_MAX_SPANS", defaultMaxSpans)
+	}
+	if !out.Logs {
+		out.Logs = envBool("RESTLYTICS_LOGS", false)
+	}
+	if out.LogsMinSeverity == 0 {
+		out.LogsMinSeverity = envInt("RESTLYTICS_LOGS_MIN_SEVERITY", defaultLogsMinSeverity)
+	}
+	if out.LogsMinSeverity < 1 {
+		out.LogsMinSeverity = 1
+	}
+	if out.LogsMinSeverity > 24 {
+		out.LogsMinSeverity = 24
 	}
 	if out.InstrumentDB == nil {
 		out.InstrumentDB = boolPtr(envBool("RESTLYTICS_INSTRUMENT_DB", true))
