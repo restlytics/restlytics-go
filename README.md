@@ -120,6 +120,32 @@ db := restlytics.OpenDB(connector, "postgresql", rl)
 db.QueryContext(r.Context(), "SELECT * FROM users WHERE id = $1", id)
 ```
 
+## Background jobs, commands, and schedules
+
+Pass the context returned to the operation through DB and HTTP calls. Names must
+be stable handler/signature names—never job ids, arguments, or payload data.
+
+```go
+carrier := restlytics.QueueCarrier{"invoice_id": invoiceID}
+_ = restlytics.Enqueue(ctx, restlytics.EnqueueOptions{
+    System: "redis", Destination: "billing",
+}, carrier, queue.Publish)
+
+err := rl.RunJob(context.Background(), restlytics.JobOptions{
+    Name: "billing.reconcile", System: "redis", Destination: "billing",
+    Attempt: attempt,
+    Traceparent: carrier["__restlytics"].(map[string]string)["traceparent"],
+}, func(jobCtx context.Context) error {
+    return reconcile(jobCtx, carrier)
+})
+```
+
+`RunCommand` captures the returned exit code and `RunSchedule` captures the cron
+expression. Jobs are `CONSUMER` roots; commands and schedules are `SERVER`
+roots. The namespaced carrier preserves trace and sampling continuity, the job
+links to its enqueue span, and enqueue I/O is isolated in
+`restlytics.self_ns.queue`. Failures never export exception or payload content.
+
 ### GORM
 
 ```go

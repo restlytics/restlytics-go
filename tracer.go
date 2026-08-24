@@ -35,6 +35,7 @@ type requestState struct {
 	rawSpans []*Span // in-request child spans, serialized + self-timed at finish
 
 	dbQueryCount int64
+	rootCategory string
 	maxSpans     int
 
 	cfg       *Config
@@ -62,11 +63,16 @@ func (t *Tracer) Config() Config { return t.cfg }
 // The sampling decision is HEAD-BASED and made exactly once here, keyed off the
 // trace id, so all spans in a trace share the same fate.
 func (t *Tracer) Start(ctx context.Context, name, traceparent string) context.Context {
+	return t.startRoot(ctx, name, traceparent, KindServer, CategoryApp, false)
+}
+
+func (t *Tracer) startRoot(ctx context.Context, name, traceparent string, kind int, category string, linkParent bool) context.Context {
 	st := &requestState{
-		enabled:   t.cfg.Enabled(),
-		maxSpans:  t.cfg.MaxSpans,
-		cfg:       &t.cfg,
-		transport: t.transport,
+		enabled:      t.cfg.Enabled(),
+		maxSpans:     t.cfg.MaxSpans,
+		cfg:          &t.cfg,
+		transport:    t.transport,
+		rootCategory: category,
 	}
 
 	var rootParent string
@@ -85,10 +91,34 @@ func (t *Tracer) Start(ctx context.Context, name, traceparent string) context.Co
 
 	if st.sampled {
 		now := nowNs()
-		st.rootSpan = newSpan(st.traceID, NewSpanID(), rootParent, name, KindServer, now, now)
+		st.rootSpan = newSpan(st.traceID, NewSpanID(), rootParent, name, kind, now, now)
+		st.rootSpan.SetString(AttrCategory, category)
+		if linkParent && rootParent != "" {
+			st.rootSpan.AddLink(st.traceID, rootParent, "enqueue")
+		}
 	}
 
 	return context.WithValue(ctx, ctxKey{}, st)
+}
+
+func startChildSpan(ctx context.Context, name, category string, kind int, spanID string) *Span {
+	st := fromContext(ctx)
+	if st == nil || !st.sampled || st.rootSpan == nil {
+		return nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if len(st.rawSpans) >= st.maxSpans {
+		return nil
+	}
+	now := nowNs()
+	if spanID == "" {
+		spanID = NewSpanID()
+	}
+	sp := newSpan(st.traceID, spanID, st.rootSpan.SpanID, name, kind, now, now)
+	sp.SetString(AttrCategory, category)
+	st.rawSpans = append(st.rawSpans, sp)
+	return sp
 }
 
 // fromContext extracts the request state, if any.
@@ -178,7 +208,10 @@ func (t *Tracer) Finish(ctx context.Context) {
 	st.rootSpan.SetEnd(nowNs())
 	st.attachSelfTime()
 	st.rootSpan.SetInt(AttrDBQueryCount, st.dbQueryCount)
-	st.rootSpan.SetString(AttrCategory, CategoryApp)
+	st.rootSpan.SetString(AttrCategory, st.rootCategory)
+	if st.rootSpan.StatusCode() == StatusUnset {
+		st.rootSpan.SetStatus(StatusOK, "")
+	}
 
 	all := make([]SpanData, 0, len(st.rawSpans)+1)
 	all = append(all, st.rootSpan.toData())
@@ -190,7 +223,7 @@ func (t *Tracer) Finish(ctx context.Context) {
 	st.transport.Send(payload)
 }
 
-// attachSelfTime computes and stamps restlytics.self_ns.{db,http,cache,app} on
+// attachSelfTime computes and stamps restlytics.self_ns.{db,http,cache,queue,app} on
 // the root span. Caller holds st.mu.
 func (st *requestState) attachSelfTime() {
 	root := st.rootSpan
@@ -204,6 +237,7 @@ func (st *requestState) attachSelfTime() {
 		CategoryDB:    nil,
 		CategoryHTTP:  nil,
 		CategoryCache: nil,
+		CategoryQueue: nil,
 		CategoryApp:   nil,
 	}
 	var all []Interval
@@ -222,6 +256,7 @@ func (st *requestState) attachSelfTime() {
 	selfDB := UnionLength(byCat[CategoryDB])
 	selfHTTP := UnionLength(byCat[CategoryHTTP])
 	selfCache := UnionLength(byCat[CategoryCache])
+	selfQueue := UnionLength(byCat[CategoryQueue])
 	// app self-time = explicit app-category child time + the root's own exclusive
 	// (uncovered) time. Mirrors the ingestion service's computation.
 	appExclusive := rootDur - UnionLength(all)
@@ -233,6 +268,7 @@ func (st *requestState) attachSelfTime() {
 	root.SetInt(AttrSelfNsDB, selfDB)
 	root.SetInt(AttrSelfNsHTTP, selfHTTP)
 	root.SetInt(AttrSelfNsCache, selfCache)
+	root.SetInt(AttrSelfNsQueue, selfQueue)
 	root.SetInt(AttrSelfNsApp, selfApp)
 }
 
