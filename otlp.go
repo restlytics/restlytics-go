@@ -56,6 +56,12 @@ type Status struct {
 	Message string `json:"message,omitempty"`
 }
 
+type SpanLink struct {
+	TraceID    string     `json:"traceId"`
+	SpanID     string     `json:"spanId"`
+	Attributes []KeyValue `json:"attributes,omitempty"`
+}
+
 // SpanData is the OTLP/JSON Span shape the ingestion contract validates.
 type SpanData struct {
 	TraceID           string     `json:"traceId"`
@@ -66,6 +72,7 @@ type SpanData struct {
 	StartTimeUnixNano string     `json:"startTimeUnixNano"`
 	EndTimeUnixNano   string     `json:"endTimeUnixNano"`
 	Attributes        []KeyValue `json:"attributes,omitempty"`
+	Links             []SpanLink `json:"links,omitempty"`
 	Status            *Status    `json:"status,omitempty"`
 }
 
@@ -164,6 +171,7 @@ const (
 	AttrSelfNsDB      = "restlytics.self_ns.db"
 	AttrSelfNsHTTP    = "restlytics.self_ns.http"
 	AttrSelfNsCache   = "restlytics.self_ns.cache"
+	AttrSelfNsQueue   = "restlytics.self_ns.queue"
 	AttrSelfNsApp     = "restlytics.self_ns.app"
 )
 
@@ -182,10 +190,13 @@ const (
 
 // restlytics.category values.
 const (
-	CategoryApp   = "app"
-	CategoryDB    = "db"
-	CategoryHTTP  = "http"
-	CategoryCache = "cache"
-	CategoryQueue = "queue"
-	CategoryOther = "other"
+	CategoryApp      = "app"
+	CategoryDB       = "db"
+	CategoryHTTP     = "http"
+	CategoryCache    = "cache"
+	CategoryQueue    = "queue"
+	CategoryOther    = "other"
+	CategoryJob      = "job"
+	CategoryCommand  = "command"
+	CategorySchedule = "schedule"
 )

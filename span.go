@@ -33,6 +33,7 @@ type Span struct {
 
 	statusCode    int
 	statusMessage string
+	links         []SpanLink
 }
 
 func newSpan(traceID, spanID, parentSpanID, name string, kind int, start, end int64) *Span {
@@ -114,12 +115,23 @@ func (s *Span) StatusCode() int {
 	return s.statusCode
 }
 
+func (s *Span) AddLink(traceID, spanID, kind string) *Span {
+	s.links = append(s.links, SpanLink{
+		TraceID: traceID,
+		SpanID:  spanID,
+		Attributes: []KeyValue{{
+			Key: "restlytics.link.kind", Value: StringValue(kind),
+		}},
+	})
+	return s
+}
+
 // category reads the span's restlytics.category attribute, defaulting to "app".
 func (s *Span) category() string {
 	if i, ok := s.index[AttrCategory]; ok {
 		if v := s.values[i].StringValue; v != nil {
 			switch *v {
-			case CategoryDB, CategoryHTTP, CategoryCache, CategoryApp:
+			case CategoryDB, CategoryHTTP, CategoryCache, CategoryQueue, CategoryApp:
 				return *v
 			}
 		}
@@ -158,6 +170,9 @@ func (s *Span) toData() SpanData {
 			attrs[i] = KeyValue{Key: k, Value: s.values[i]}
 		}
 		d.Attributes = attrs
+	}
+	if len(s.links) > 0 {
+		d.Links = append([]SpanLink(nil), s.links...)
 	}
 
 	// Only attach status when it carries signal (OK/ERROR); UNSET is the default.
