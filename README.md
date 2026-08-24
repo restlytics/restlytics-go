@@ -10,6 +10,8 @@ wire format (see [`../SPEC.md`](../SPEC.md)) — one contract, every language.
 - **Fire-and-forget**: spans are buffered in-request and flushed *after* the
   response, gzipped, with a ~2s timeout and all errors swallowed. The host app is
   never blocked and never sees a panic from the SDK.
+- **Opt-in native logs**: a composable `slog.Handler` exports WARN+ records as
+  OTLP/JSON to `/v1/logs`, automatically correlated to the active trace.
 - **Dependency-free core**: the root package uses only the Go standard library,
   so it compiles offline. Framework adapters live in subpackages.
 
@@ -28,7 +30,7 @@ Pass a `Config` to `Init`, or leave fields empty and configure via environment:
 | Env var | Default | Meaning |
 |---|---|---|
 | `RESTLYTICS_KEY` | _(empty → SDK disabled)_ | Project ingest key (`X-Restlytics-Key`) |
-| `RESTLYTICS_INGEST_URL` | `https://ingest.restlytics.com` | Base URL; POSTs to `{url}/v1/traces` |
+| `RESTLYTICS_INGEST_URL` | `https://ingest.restlytics.com` | Base URL; POSTs to `{url}/v1/traces` and `{url}/v1/logs` |
 | `RESTLYTICS_SERVICE_NAME` | `go-app` | `service.name` resource attribute |
 | `RESTLYTICS_ENV` | `production` | `deployment.environment` |
 | `RESTLYTICS_SAMPLE_RATE` | `1.0` | Head-based trace-id-ratio sample rate |
@@ -36,6 +38,8 @@ Pass a `Config` to `Init`, or leave fields empty and configure via environment:
 | `RESTLYTICS_TIMEOUT_MS` | `2000` | Send timeout (ms) |
 | `RESTLYTICS_CAPTURE_SQL` | `false` | Send raw `db.query.text` (capped 2048) |
 | `RESTLYTICS_MAX_SPANS` | `2000` | Per-request child span cap |
+| `RESTLYTICS_LOGS` | `false` | Enable native `log/slog` export to `/v1/logs` |
+| `RESTLYTICS_LOGS_MIN_SEVERITY` | `13` | Minimum OTel severity number (`13` = WARN, `17` = ERROR) |
 | `RESTLYTICS_INSTRUMENT_DB` / `_HTTP` / `_CACHE` | `true` | Per-instrument toggles |
 
 Before connecting production data, set `RESTLYTICS_TRANSPORT=preview` and drive
@@ -46,9 +50,10 @@ JSON/gzip byte sizes. Use `RESTLYTICS_SAMPLE_RATE=1` for a deterministic review.
 
 ## Delivery reliability and shutdown
 
-`HTTPTransport` owns one worker goroutine and a fixed 64-batch channel. `Send`
-only attempts a non-blocking enqueue; saturation drops the new batch instead of
-blocking or spawning goroutines, and delivery is never retried. Use
+`HTTPTransport` owns one worker goroutine and one fixed 64-batch channel shared
+by traces and logs. `Send` and `SendLogs` only attempt a non-blocking enqueue;
+saturation drops the new batch instead of blocking or spawning goroutines, and
+delivery is never retried. Use
 `Diagnostics()` for payload-free accepted/delivered/dropped/failed counters and
 shut down with a bounded context:
 
@@ -71,6 +76,34 @@ rl := restlytics.Init(restlytics.Config{
 ```
 
 A missing key yields a no-op SDK — safe to ship before a key is provisioned.
+
+## Native `log/slog` export
+
+Log export is disabled by default. Enable it with `RESTLYTICS_LOGS=true` (or
+`Config.Logs`) and wrap the handler your application already uses:
+
+```go
+rl := restlytics.Init(restlytics.Config{})
+appHandler := slog.NewJSONHandler(os.Stdout, nil)
+logger := slog.New(rl.SlogHandler(appHandler))
+
+// Context-aware methods attach traceId, spanId, and sampled flags.
+logger.ErrorContext(r.Context(), "checkout failed", "order.id", orderID)
+```
+
+The original record is still delivered unchanged to `appHandler`; only the
+exported copy is scrubbed. Standard slog levels map deterministically to OTel
+`DEBUG=5`, `INFO=9`, `WARN=13`, and `ERROR=17`. Custom levels above ERROR map to
+`ERROR2=18` and `FATAL=21`. Logs are not trace-sampled: a qualifying ERROR in an
+unsampled request is still sent with that request's trace/span ids and flags.
+Outside a Restlytics context, correlation fields are omitted.
+
+Each exported record is bounded to an 8 KiB message and at most 64 structured
+attributes (2 KiB per string value). The source scrubber removes recognizable
+credentials, emails, private keys, URL credentials/fragments/query values, and
+request/response or binding content; attributes with sensitive keys and
+arbitrary objects/errors fail closed. The transport remains a fixed-size,
+non-blocking queue, and every capture or delivery failure is swallowed.
 
 ## net/http
 
@@ -161,6 +194,8 @@ db.Use(restlyticsgorm.New(rl, "postgresql"))
   `db.query.summary` (the N+1 grouping key).
 - Every outbound `url.full` query value is scrubbed; credentials/fragments, headers,
   bodies, and exception content are never exported.
+- Native logs are opt-in and source-redacted before entering the bounded
+  transport; use context-aware slog methods for automatic trace correlation.
 - Per-request state is isolated via `context.Context` — no shared singleton, safe
   under concurrency.
 - The in-request buffer is capped (default 2000 spans).

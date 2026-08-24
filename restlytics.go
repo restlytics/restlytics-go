@@ -16,6 +16,7 @@ package restlytics
 
 import (
 	"context"
+	"log/slog"
 	"net/url"
 	"strings"
 )
@@ -23,8 +24,9 @@ import (
 // Restlytics is the top-level SDK handle returned by Init. It owns the resolved
 // config + transport and produces middleware / DB wrappers.
 type Restlytics struct {
-	tracer *Tracer
-	cfg    Config
+	tracer        *Tracer
+	logsTransport LogsTransport
+	cfg           Config
 }
 
 // Init resolves the config (filling gaps from RESTLYTICS_* env vars), selects a
@@ -34,8 +36,9 @@ func Init(cfg Config) *Restlytics {
 	resolved := cfg.Resolve()
 	transport := transportFromConfig(resolved)
 	return &Restlytics{
-		tracer: NewTracer(resolved, transport),
-		cfg:    resolved,
+		tracer:        NewTracer(resolved, transport),
+		logsTransport: logsTransportFromConfig(resolved, transport),
+		cfg:           resolved,
 	}
 }
 
@@ -47,6 +50,14 @@ func (r *Restlytics) Config() Config { return r.cfg }
 
 // Enabled reports whether the SDK will emit traces (i.e. a key is configured).
 func (r *Restlytics) Enabled() bool { return r.cfg.Enabled() }
+
+// SlogHandler returns a log/slog handler that exports qualifying records and
+// delegates unchanged records to next. Pass nil for a capture-only handler.
+// Use the context-aware slog methods (InfoContext, ErrorContext, and so on) to
+// attach the active Restlytics trace and span identifiers.
+func (r *Restlytics) SlogHandler(next slog.Handler) slog.Handler {
+	return NewSlogHandler(r, next)
+}
 
 // ShouldTrace reports whether the given request path should be traced (i.e. is
 // not in the ignore list). Trailing `*` acts as a prefix wildcard.

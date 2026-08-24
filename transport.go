@@ -23,6 +23,18 @@ type Transport interface {
 	Send(payload ExportTraceServiceRequest)
 }
 
+// LogsTransport sends assembled OTLP log payloads. HTTPTransport implements
+// both Transport and LogsTransport so both signals share one bounded queue and
+// one fire-and-forget worker.
+type LogsTransport interface {
+	SendLogs(payload ExportLogsServiceRequest)
+}
+
+type outboundBatch struct {
+	url     string
+	payload any
+}
+
 // TransportDiagnostics is a payload-free snapshot suitable for health checks and
 // shutdown logs. Counts are process-local and monotonic.
 type TransportDiagnostics struct {
@@ -41,7 +53,7 @@ type TransportDiagnostics struct {
 //
 // Wire format (must match the ingestion contract exactly):
 //
-//	POST {ingestURL}/v1/traces
+//	POST {ingestURL}/v1/traces or /v1/logs
 //	X-Restlytics-Key: {key}
 //	Content-Type: application/json
 //	Content-Encoding: gzip
@@ -49,10 +61,11 @@ type TransportDiagnostics struct {
 //
 // Every error path is swallowed — telemetry must never hurt the host app.
 type HTTPTransport struct {
-	url       string
+	tracesURL string
+	logsURL   string
 	key       string
 	client    *http.Client
-	queue     chan ExportTraceServiceRequest
+	queue     chan outboundBatch
 	done      chan struct{}
 	stopped   chan struct{}
 	acceptMu  sync.Mutex
@@ -79,14 +92,15 @@ func newHTTPTransport(ingestURL, key string, timeout time.Duration, queueCapacit
 	if queueCapacity <= 0 {
 		queueCapacity = 64
 	}
-	url := strings.TrimRight(ingestURL, "/") + "/v1/traces"
+	baseURL := strings.TrimRight(ingestURL, "/")
 	t := &HTTPTransport{
-		url: url,
-		key: key,
+		tracesURL: baseURL + "/v1/traces",
+		logsURL:   baseURL + "/v1/logs",
+		key:       key,
 		client: &http.Client{
 			Timeout: timeout,
 		},
-		queue:   make(chan ExportTraceServiceRequest, queueCapacity),
+		queue:   make(chan outboundBatch, queueCapacity),
 		done:    make(chan struct{}),
 		stopped: make(chan struct{}),
 	}
@@ -96,16 +110,26 @@ func newHTTPTransport(ingestURL, key string, timeout time.Duration, queueCapacit
 
 // Send performs only a bounded non-blocking enqueue and returns immediately.
 func (t *HTTPTransport) Send(payload ExportTraceServiceRequest) {
+	t.enqueue(outboundBatch{url: t.tracesURL, payload: payload})
+}
+
+// SendLogs performs the same bounded non-blocking enqueue as Send, targeting
+// the OTLP/HTTP logs endpoint.
+func (t *HTTPTransport) SendLogs(payload ExportLogsServiceRequest) {
+	t.enqueue(outboundBatch{url: t.logsURL, payload: payload})
+}
+
+func (t *HTTPTransport) enqueue(batch outboundBatch) {
 	t.acceptMu.Lock()
 	defer t.acceptMu.Unlock()
-	if t.closed.Load() || t.url == "" || t.key == "" {
+	if t.closed.Load() || batch.url == "" || t.key == "" {
 		t.dropped.Add(1)
 		return
 	}
 
 	t.pending.Add(1)
 	select {
-	case t.queue <- payload:
+	case t.queue <- batch:
 		t.accepted.Add(1)
 	default:
 		t.pending.Add(-1)
@@ -164,9 +188,9 @@ func (t *HTTPTransport) run() {
 	defer close(t.stopped)
 	for {
 		select {
-		case payload := <-t.queue:
+		case batch := <-t.queue:
 			t.inFlight.Store(1)
-			if t.post(payload) {
+			if t.post(batch) {
 				t.delivered.Add(1)
 			} else {
 				t.failed.Add(1)
@@ -179,19 +203,19 @@ func (t *HTTPTransport) run() {
 	}
 }
 
-func (t *HTTPTransport) post(payload ExportTraceServiceRequest) (delivered bool) {
+func (t *HTTPTransport) post(batch outboundBatch) (delivered bool) {
 	defer func() {
 		if recover() != nil {
 			delivered = false
 		}
 	}()
-	body, err := gzipJSON(payload)
+	body, err := gzipJSON(batch.payload)
 	if err != nil {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), t.client.Timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, t.url, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, batch.url, bytes.NewReader(body))
 	if err != nil {
 		return false
 	}
@@ -207,7 +231,7 @@ func (t *HTTPTransport) post(payload ExportTraceServiceRequest) (delivered bool)
 	return true
 }
 
-func gzipJSON(payload ExportTraceServiceRequest) ([]byte, error) {
+func gzipJSON(payload any) ([]byte, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -234,6 +258,9 @@ type NullTransport struct{}
 // Send does nothing.
 func (NullTransport) Send(ExportTraceServiceRequest) {}
 
+// SendLogs does nothing.
+func (NullTransport) SendLogs(ExportLogsServiceRequest) {}
+
 // LogTransport writes the JSON payload to a logger (local debugging). It marshals
 // synchronously but swallows errors and never panics.
 type LogTransport struct {
@@ -242,6 +269,15 @@ type LogTransport struct {
 
 // Send logs the payload as pretty JSON.
 func (t LogTransport) Send(payload ExportTraceServiceRequest) {
+	t.logPayload(payload)
+}
+
+// SendLogs logs a logs payload for local debugging.
+func (t LogTransport) SendLogs(payload ExportLogsServiceRequest) {
+	t.logPayload(payload)
+}
+
+func (t LogTransport) logPayload(payload any) {
 	defer func() { _ = recover() }()
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -276,6 +312,20 @@ type PreviewTransport struct {
 	Writer     io.Writer
 	mu         sync.Mutex
 	Reports    []TelemetryPreview
+	LogReports []LogTelemetryPreview
+}
+
+// LogTelemetryPreview is the local-only counterpart to TelemetryPreview for
+// production-shaped OTLP log batches.
+type LogTelemetryPreview struct {
+	Mode                   string                   `json:"mode"`
+	NetworkRequestMade     bool                     `json:"networkRequestMade"`
+	Signal                 string                   `json:"signal"`
+	RecordCount            int                      `json:"recordCount"`
+	JSONBytes              int                      `json:"jsonBytes"`
+	GzipBytes              int                      `json:"gzipBytes"`
+	RedactionPolicyApplied []string                 `json:"redactionPolicyApplied"`
+	Payload                ExportLogsServiceRequest `json:"payload"`
 }
 
 // NewPreviewTransport creates a local-only preview transport.
@@ -336,6 +386,56 @@ func (t *PreviewTransport) Send(payload ExportTraceServiceRequest) {
 	t.mu.Unlock()
 }
 
+// SendLogs records a bounded local preview without opening a socket.
+func (t *PreviewTransport) SendLogs(payload ExportLogsServiceRequest) {
+	defer func() { _ = recover() }()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return
+	}
+	gzipped, err := gzipJSON(payload)
+	if err != nil {
+		return
+	}
+	recordCount := 0
+	for _, resource := range payload.ResourceLogs {
+		for _, scope := range resource.ScopeLogs {
+			recordCount += len(scope.LogRecords)
+		}
+	}
+	report := LogTelemetryPreview{
+		Mode:               "preview",
+		NetworkRequestMade: false,
+		Signal:             "logs",
+		RecordCount:        recordCount,
+		JSONBytes:          len(raw),
+		GzipBytes:          len(gzipped),
+		RedactionPolicyApplied: []string{
+			"credentials and personal data in log text",
+			"URL credentials, fragments, and query values",
+			"sensitive structured attributes",
+			"bounded body and attribute content",
+		},
+		Payload: payload,
+	}
+	encoded, err := json.MarshalIndent(report, "", "  ")
+	if err != nil {
+		return
+	}
+	t.mu.Lock()
+	t.LogReports = append(t.LogReports, report)
+	if len(t.LogReports) > 16 {
+		t.LogReports = append([]LogTelemetryPreview(nil), t.LogReports[len(t.LogReports)-16:]...)
+	}
+	writer := t.Writer
+	if writer != nil {
+		_, _ = fmt.Fprintln(writer, string(encoded))
+	} else {
+		log.Printf("restlytics preview: %s", encoded)
+	}
+	t.mu.Unlock()
+}
+
 // transportFromConfig picks a Transport from a resolved Config.
 func transportFromConfig(c Config) Transport {
 	if c.CustomTransport != nil {
@@ -351,4 +451,14 @@ func transportFromConfig(c Config) Transport {
 	default: // "http", "curl", anything else
 		return NewHTTPTransport(c.IngestURL, c.Key, time.Duration(c.TimeoutMs)*time.Millisecond)
 	}
+}
+
+func logsTransportFromConfig(c Config, traceTransport Transport) LogsTransport {
+	if c.CustomLogsTransport != nil {
+		return c.CustomLogsTransport
+	}
+	if transport, ok := traceTransport.(LogsTransport); ok {
+		return transport
+	}
+	return NullTransport{}
 }

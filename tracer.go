@@ -29,8 +29,9 @@ type requestState struct {
 	enabled bool
 	sampled bool
 
-	traceID  string
-	rootSpan *Span
+	traceID    string
+	rootSpanID string
+	rootSpan   *Span
 
 	rawSpans []*Span // in-request child spans, serialized + self-timed at finish
 
@@ -88,10 +89,11 @@ func (t *Tracer) startRoot(ctx context.Context, name, traceparent string, kind i
 		st.traceID = NewTraceID()
 		st.sampled = st.enabled && sampleDecision(st.traceID, t.cfg.SampleRate)
 	}
+	st.rootSpanID = NewSpanID()
 
 	if st.sampled {
 		now := nowNs()
-		st.rootSpan = newSpan(st.traceID, NewSpanID(), rootParent, name, kind, now, now)
+		st.rootSpan = newSpan(st.traceID, st.rootSpanID, rootParent, name, kind, now, now)
 		st.rootSpan.SetString(AttrCategory, category)
 		if linkParent && rootParent != "" {
 			st.rootSpan.AddLink(st.traceID, rootParent, "enqueue")
@@ -152,6 +154,40 @@ func TraceID(ctx context.Context) string {
 		return ""
 	}
 	return st.traceID
+}
+
+// CurrentTraceID returns the ambient trace id for log correlation, including
+// unsampled traces. It returns an empty string outside a Restlytics unit of work.
+func CurrentTraceID(ctx context.Context) string {
+	st := fromContext(ctx)
+	if st == nil || !st.enabled {
+		return ""
+	}
+	return st.traceID
+}
+
+// CurrentSpanID returns the ambient root span id for log correlation. Go child
+// spans are recorded post-hoc, so the root is the innermost open span available
+// to slog at record time.
+func CurrentSpanID(ctx context.Context) string {
+	st := fromContext(ctx)
+	if st == nil || !st.enabled {
+		return ""
+	}
+	return st.rootSpanID
+}
+
+// CurrentTraceFlags returns the W3C trace flags and whether a Restlytics trace
+// is ambient. Logs are exported independently of this sampling decision.
+func CurrentTraceFlags(ctx context.Context) (int, bool) {
+	st := fromContext(ctx)
+	if st == nil || !st.enabled {
+		return 0, false
+	}
+	if st.sampled {
+		return 1, true
+	}
+	return 0, true
 }
 
 // AddChildSpan creates and records a CLIENT child span over an absolute
