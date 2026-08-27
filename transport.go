@@ -30,9 +30,62 @@ type LogsTransport interface {
 	SendLogs(payload ExportLogsServiceRequest)
 }
 
+// Exporter is the stable provider-neutral custom export contract. Implement it
+// to route the production-shaped OTLP/JSON payloads to an OpenTelemetry
+// Collector, another observability backend, durable storage, or a test sink.
+//
+// Restlytics owns the fire-and-forget boundary: calls happen on one bounded
+// worker queue, receive a context limited by Config.TimeoutMs, and never execute
+// on the instrumented application path. Returned errors and panics are contained
+// and counted as failed batches. An implementation should still honor ctx so a
+// bounded Flush or Shutdown can complete promptly.
+type Exporter interface {
+	ExportTraces(ctx context.Context, payload ExportTraceServiceRequest) error
+	ExportLogs(ctx context.Context, payload ExportLogsServiceRequest) error
+}
+
+// ExporterFlusher is an optional extension for exporters with their own buffer.
+// It is called only after Restlytics has drained its accepted work. Flush errors,
+// panics, and deadline overruns are contained and reported as a false result from
+// Restlytics.Flush.
+type ExporterFlusher interface {
+	Flush(ctx context.Context) error
+}
+
+// ExporterShutdown is an optional extension for exporters that own resources.
+// It is called at most once, after Restlytics has stopped accepting work and
+// drained its queue. Errors and panics are contained.
+type ExporterShutdown interface {
+	Shutdown(ctx context.Context) error
+}
+
+// transportLifecycle is implemented by transports whose accepted work and
+// resources can be bounded during process shutdown.
+type transportLifecycle interface {
+	Flush(context.Context) bool
+	Shutdown(context.Context) bool
+}
+
+type diagnosticTransport interface {
+	Diagnostics() TransportDiagnostics
+}
+
 type outboundBatch struct {
 	url     string
 	payload any
+}
+
+type exportSignal uint8
+
+const (
+	exportSignalTraces exportSignal = iota + 1
+	exportSignalLogs
+)
+
+type customExportBatch struct {
+	signal exportSignal
+	traces ExportTraceServiceRequest
+	logs   ExportLogsServiceRequest
 }
 
 // TransportDiagnostics is a payload-free snapshot suitable for health checks and
@@ -46,6 +99,219 @@ type TransportDiagnostics struct {
 	InFlightBatches  int64
 	QueueCapacity    int
 	Closed           bool
+}
+
+// managedExporter adapts the public Exporter contract to the original internal
+// signal transports. It deliberately mirrors HTTPTransport's single-worker,
+// bounded, non-blocking delivery behavior.
+type managedExporter struct {
+	exporter  Exporter
+	timeout   time.Duration
+	queue     chan customExportBatch
+	done      chan struct{}
+	stopped   chan struct{}
+	acceptMu  sync.Mutex
+	stopOnce  sync.Once
+	closeOnce sync.Once
+	closeDone chan struct{}
+	closed    atomic.Bool
+	closeOK   atomic.Bool
+	pending   atomic.Int64
+	inFlight  atomic.Int64
+	accepted  atomic.Int64
+	delivered atomic.Int64
+	dropped   atomic.Int64
+	failed    atomic.Int64
+}
+
+func newManagedExporter(exporter Exporter, timeout time.Duration, queueCapacity int) *managedExporter {
+	if timeout <= 0 {
+		timeout = 2 * time.Second
+	}
+	if queueCapacity <= 0 {
+		queueCapacity = 64
+	}
+	t := &managedExporter{
+		exporter:  exporter,
+		timeout:   timeout,
+		queue:     make(chan customExportBatch, queueCapacity),
+		done:      make(chan struct{}),
+		stopped:   make(chan struct{}),
+		closeDone: make(chan struct{}),
+	}
+	t.closeOK.Store(true)
+	go t.run()
+	return t
+}
+
+// Send performs only a bounded enqueue; customer code never runs here.
+func (t *managedExporter) Send(payload ExportTraceServiceRequest) {
+	t.enqueue(customExportBatch{signal: exportSignalTraces, traces: payload})
+}
+
+// SendLogs performs only a bounded enqueue; customer code never runs here.
+func (t *managedExporter) SendLogs(payload ExportLogsServiceRequest) {
+	t.enqueue(customExportBatch{signal: exportSignalLogs, logs: payload})
+}
+
+func (t *managedExporter) enqueue(batch customExportBatch) {
+	t.acceptMu.Lock()
+	defer t.acceptMu.Unlock()
+	if t.closed.Load() || t.exporter == nil {
+		t.dropped.Add(1)
+		return
+	}
+	t.pending.Add(1)
+	select {
+	case t.queue <- batch:
+		t.accepted.Add(1)
+	default:
+		t.pending.Add(-1)
+		t.dropped.Add(1)
+	}
+}
+
+// Diagnostics returns payload-free delivery counters for the custom exporter.
+func (t *managedExporter) Diagnostics() TransportDiagnostics {
+	return TransportDiagnostics{
+		AcceptedBatches:  t.accepted.Load(),
+		DeliveredBatches: t.delivered.Load(),
+		DroppedBatches:   t.dropped.Load(),
+		FailedBatches:    t.failed.Load(),
+		QueuedBatches:    len(t.queue),
+		InFlightBatches:  t.inFlight.Load(),
+		QueueCapacity:    cap(t.queue),
+		Closed:           t.closed.Load(),
+	}
+}
+
+// Flush drains accepted Restlytics work and then invokes the optional exporter
+// flush hook. Both phases obey ctx.
+func (t *managedExporter) Flush(ctx context.Context) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !waitForPending(ctx, &t.pending) {
+		return false
+	}
+	flusher, ok := t.exporter.(ExporterFlusher)
+	if !ok {
+		return true
+	}
+	return callExporterHook(ctx, flusher.Flush)
+}
+
+// Shutdown stops acceptance, drains queued work, stops the Restlytics worker,
+// and invokes the optional exporter shutdown hook. It is idempotent.
+func (t *managedExporter) Shutdown(ctx context.Context) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-t.stopped:
+		return t.shutdownExporter(ctx)
+	default:
+	}
+	t.acceptMu.Lock()
+	t.closed.Store(true)
+	t.acceptMu.Unlock()
+	if !t.Flush(ctx) {
+		return false
+	}
+	t.stopOnce.Do(func() { close(t.done) })
+	select {
+	case <-t.stopped:
+	case <-ctx.Done():
+		return false
+	}
+	return t.shutdownExporter(ctx)
+}
+
+func (t *managedExporter) shutdownExporter(ctx context.Context) bool {
+	shutdown, ok := t.exporter.(ExporterShutdown)
+	if !ok {
+		return true
+	}
+	t.closeOnce.Do(func() {
+		t.closeOK.Store(callExporterHook(ctx, shutdown.Shutdown))
+		close(t.closeDone)
+	})
+	select {
+	case <-t.closeDone:
+		return t.closeOK.Load()
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (t *managedExporter) run() {
+	defer close(t.stopped)
+	for {
+		select {
+		case batch := <-t.queue:
+			t.inFlight.Store(1)
+			if t.export(batch) {
+				t.delivered.Add(1)
+			} else {
+				t.failed.Add(1)
+			}
+			t.inFlight.Store(0)
+			t.pending.Add(-1)
+		case <-t.done:
+			return
+		}
+	}
+}
+
+func (t *managedExporter) export(batch customExportBatch) (delivered bool) {
+	defer func() {
+		if recover() != nil {
+			delivered = false
+		}
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), t.timeout)
+	defer cancel()
+	switch batch.signal {
+	case exportSignalTraces:
+		return t.exporter.ExportTraces(ctx, batch.traces) == nil
+	case exportSignalLogs:
+		return t.exporter.ExportLogs(ctx, batch.logs) == nil
+	default:
+		return false
+	}
+}
+
+func waitForPending(ctx context.Context, pending *atomic.Int64) bool {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if pending.Load() == 0 {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
+	}
+}
+
+func callExporterHook(ctx context.Context, hook func(context.Context) error) bool {
+	result := make(chan bool, 1)
+	go func() {
+		ok := false
+		defer func() {
+			_ = recover()
+			result <- ok
+		}()
+		ok = hook(ctx) == nil
+	}()
+	select {
+	case ok := <-result:
+		return ok
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // HTTPTransport gzips the JSON body and POSTs it with net/http using one worker
@@ -438,6 +704,9 @@ func (t *PreviewTransport) SendLogs(payload ExportLogsServiceRequest) {
 
 // transportFromConfig picks a Transport from a resolved Config.
 func transportFromConfig(c Config) Transport {
+	if c.CustomExporter != nil {
+		return newManagedExporter(c.CustomExporter, time.Duration(c.TimeoutMs)*time.Millisecond, 64)
+	}
 	if c.CustomTransport != nil {
 		return c.CustomTransport
 	}
@@ -454,6 +723,12 @@ func transportFromConfig(c Config) Transport {
 }
 
 func logsTransportFromConfig(c Config, traceTransport Transport) LogsTransport {
+	if c.CustomExporter != nil {
+		if transport, ok := traceTransport.(LogsTransport); ok {
+			return transport
+		}
+		return NullTransport{}
+	}
 	if c.CustomLogsTransport != nil {
 		return c.CustomLogsTransport
 	}
