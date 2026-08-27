@@ -54,16 +54,20 @@ JSON/gzip byte sizes. Use `RESTLYTICS_SAMPLE_RATE=1` for a deterministic review.
 by traces and logs. `Send` and `SendLogs` only attempt a non-blocking enqueue;
 saturation drops the new batch instead of blocking or spawning goroutines, and
 delivery is never retried. Use
-`Diagnostics()` for payload-free accepted/delivered/dropped/failed counters and
-shut down with a bounded context:
+`TransportDiagnostics()` for payload-free accepted/delivered/dropped/failed
+counters and shut down the SDK with a bounded context:
 
 ```go
-health := transport.Diagnostics()
-log.Printf("restlytics drops=%d failures=%d", health.DroppedBatches, health.FailedBatches)
+health, available := rl.TransportDiagnostics()
+if available {
+    log.Printf("restlytics drops=%d failures=%d", health.DroppedBatches, health.FailedBatches)
+}
 
 ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 defer cancel()
-transport.Shutdown(ctx)
+if !rl.Shutdown(ctx) {
+    log.Print("restlytics shutdown exceeded its deadline or exporter cleanup failed")
+}
 ```
 
 ```go
@@ -75,7 +79,64 @@ rl := restlytics.Init(restlytics.Config{
 })
 ```
 
-A missing key yields a no-op SDK — safe to ship before a key is provisioned.
+A missing key yields a no-op SDK with the default HTTP transport — safe to ship
+before a key is provisioned. Preview and custom exporters intentionally work
+without a Restlytics ingest key.
+
+## Custom exporter
+
+Use `Config.CustomExporter` to route the same source-redacted production OTLP
+trace and log payloads to a collector, another provider, or a durable customer
+sink. The exporter is independent of Restlytics ingest: it does not require a
+Restlytics key, and the SDK does not pass a key, header, or tenant identity to
+callbacks.
+
+```go
+type collectorExporter struct {
+    // customer-owned client or buffer
+}
+
+func (e *collectorExporter) ExportTraces(
+    ctx context.Context,
+    payload restlytics.ExportTraceServiceRequest,
+) error {
+    return e.send(ctx, "/v1/traces", payload)
+}
+
+func (e *collectorExporter) ExportLogs(
+    ctx context.Context,
+    payload restlytics.ExportLogsServiceRequest,
+) error {
+    return e.send(ctx, "/v1/logs", payload)
+}
+
+// Optional: implement restlytics.ExporterFlusher and
+// restlytics.ExporterShutdown when the customer sink owns buffers/resources.
+func (e *collectorExporter) Flush(ctx context.Context) error { return e.flush(ctx) }
+func (e *collectorExporter) Shutdown(ctx context.Context) error { return e.close(ctx) }
+
+exporter := &collectorExporter{}
+rl := restlytics.Init(restlytics.Config{
+    CustomExporter: exporter,
+    ServiceName:    "checkout",
+    Environment:    "production",
+    Logs:           true,
+})
+```
+
+`Exporter.ExportTraces` and `Exporter.ExportLogs` run on the SDK's single
+fixed-size worker queue, never on the instrumented request/job/log path. Each
+call receives a `Config.TimeoutMs`-bounded context. Returned errors and panics
+are swallowed and reflected in `TransportDiagnostics`; saturation drops new
+batches. `rl.Flush(ctx)` and `rl.Shutdown(ctx)` are bounded, return `false` for
+deadline or optional lifecycle-hook failure, and never panic into the host.
+Exporter implementations should honor cancellation; a callback that ignores its
+context can occupy the one worker until it returns, while host work remains
+non-blocking and the fixed queue safely drops overflow.
+
+The older `Config.CustomTransport` and `Config.CustomLogsTransport` fields remain
+source-compatible but are deprecated. `CustomExporter` is the unified contract
+for new integrations and takes precedence when both are configured.
 
 ## Native `log/slog` export
 

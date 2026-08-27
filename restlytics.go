@@ -26,18 +26,25 @@ import (
 type Restlytics struct {
 	tracer        *Tracer
 	logsTransport LogsTransport
+	lifecycle     transportLifecycle
+	diagnostics   diagnosticTransport
 	cfg           Config
 }
 
 // Init resolves the config (filling gaps from RESTLYTICS_* env vars), selects a
 // transport, and returns an SDK handle. It never panics; a missing key simply
-// yields a disabled (no-op) SDK.
+// yields a disabled default HTTP transport unless a custom exporter or local
+// preview transport is configured.
 func Init(cfg Config) *Restlytics {
 	resolved := cfg.Resolve()
 	transport := transportFromConfig(resolved)
+	lifecycle, _ := transport.(transportLifecycle)
+	diagnostics, _ := transport.(diagnosticTransport)
 	return &Restlytics{
 		tracer:        NewTracer(resolved, transport),
 		logsTransport: logsTransportFromConfig(resolved, transport),
+		lifecycle:     lifecycle,
+		diagnostics:   diagnostics,
 		cfg:           resolved,
 	}
 }
@@ -48,8 +55,63 @@ func (r *Restlytics) Tracer() *Tracer { return r.tracer }
 // Config returns the resolved config.
 func (r *Restlytics) Config() Config { return r.cfg }
 
-// Enabled reports whether the SDK will emit traces (i.e. a key is configured).
+// Enabled reports whether the SDK has a configured export destination.
 func (r *Restlytics) Enabled() bool { return r.cfg.Enabled() }
+
+// Flush waits for telemetry already accepted by the configured transport. It
+// returns false on deadline or lifecycle-hook failure/panic and never lets a
+// customer exporter failure escape into the host application. Individual batch
+// failures are reported by TransportDiagnostics. Transports with no lifecycle
+// support are already synchronous/no-op and return true.
+func (r *Restlytics) Flush(ctx context.Context) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	if r == nil || r.lifecycle == nil {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return r.lifecycle.Flush(ctx)
+}
+
+// Shutdown stops new transport work, flushes accepted telemetry, and releases
+// owned resources within ctx. It is safe to call more than once. A false result
+// reports an incomplete/failed shutdown; failures never panic into the host.
+func (r *Restlytics) Shutdown(ctx context.Context) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	if r == nil || r.lifecycle == nil {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return r.lifecycle.Shutdown(ctx)
+}
+
+// TransportDiagnostics returns payload-free, process-local delivery counters
+// when the configured transport supports them. The boolean is false for legacy
+// transports without diagnostics. No payload, key, header, or tenant identity is
+// included in the snapshot.
+func (r *Restlytics) TransportDiagnostics() (snapshot TransportDiagnostics, available bool) {
+	defer func() {
+		if recover() != nil {
+			snapshot = TransportDiagnostics{}
+			available = false
+		}
+	}()
+	if r == nil || r.diagnostics == nil {
+		return TransportDiagnostics{}, false
+	}
+	return r.diagnostics.Diagnostics(), true
+}
 
 // SlogHandler returns a log/slog handler that exports qualifying records and
 // delegates unchanged records to next. Pass nil for a capture-only handler.

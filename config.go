@@ -48,11 +48,22 @@ type Config struct {
 	// RedactionQueryKeys are query-string keys scrubbed from url.full.
 	RedactionQueryKeys []string
 
-	// Transport lets callers inject a custom transport (e.g. in tests). When set
-	// it overrides the Transport string selection.
+	// CustomExporter installs one provider-neutral exporter for traces and logs.
+	// Restlytics invokes it from its own bounded worker queue, supplies a per-call
+	// timeout context, and contains returned errors and panics. It takes precedence
+	// over Transport, CustomTransport, and CustomLogsTransport.
+	CustomExporter Exporter
+
+	// CustomTransport lets callers inject the original traces-only transport.
+	// When set it overrides the Transport string selection.
+	//
+	// Deprecated: use CustomExporter for new integrations. This field remains for
+	// source compatibility with existing applications and tests.
 	CustomTransport Transport
-	// CustomLogsTransport overrides log delivery. When omitted, a selected
+	// CustomLogsTransport overrides log delivery. When omitted, a selected legacy
 	// transport that implements LogsTransport is reused for both signals.
+	//
+	// Deprecated: use CustomExporter for new integrations.
 	CustomLogsTransport LogsTransport
 }
 
@@ -139,9 +150,11 @@ func (c Config) Resolve() Config {
 	return out
 }
 
-// Enabled reports whether the SDK should actually emit traces.
+// Enabled reports whether the SDK has credentials for the default transport or
+// an explicitly configured local/custom export destination.
 func (c Config) Enabled() bool {
-	return c.Key != "" || strings.EqualFold(c.Transport, "preview")
+	return c.Key != "" || c.CustomExporter != nil || c.CustomTransport != nil ||
+		c.CustomLogsTransport != nil || strings.EqualFold(c.Transport, "preview")
 }
 
 func envOr(key, fallback string) string {
