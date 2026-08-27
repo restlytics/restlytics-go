@@ -108,7 +108,7 @@ type ExportTraceServiceRequest struct {
 const (
 	SDKName     = "restlytics-go"
 	SDKLanguage = "go"
-	SDKVersion  = "0.1.0"
+	SDKVersion  = "0.5.0"
 )
 
 // BuildPayload assembles an ExportTraceServiceRequest from the request's spans.
