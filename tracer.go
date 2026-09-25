@@ -123,6 +123,15 @@ func startChildSpan(ctx context.Context, name, category string, kind int, spanID
 	return sp
 }
 
+func outboundContext(ctx context.Context) (traceparent, spanID string, ok bool) {
+	st := fromContext(ctx)
+	if st == nil || !st.enabled || st.traceID == "" {
+		return "", "", false
+	}
+	spanID = NewSpanID()
+	return FormatTraceparent(st.traceID, spanID, st.sampled), spanID, true
+}
+
 // fromContext extracts the request state, if any.
 func fromContext(ctx context.Context) *requestState {
 	if ctx == nil {
@@ -198,6 +207,13 @@ func CurrentTraceFlags(ctx context.Context) (int, bool) {
 // The returned span may be mutated (attributes/status) until Finish is called;
 // after Finish the span is frozen into the outgoing buffer.
 func AddChildSpan(ctx context.Context, name string, startNs, endNs int64) *Span {
+	return addChildSpanWithID(ctx, name, startNs, endNs, "", nil)
+}
+
+// addChildSpanWithID records a CLIENT child under a pre-minted span id. decorate
+// runs before the span is published to the request buffer, so a call finishing
+// concurrently with Finish never mutates a span that Finish is reading.
+func addChildSpanWithID(ctx context.Context, name string, startNs, endNs int64, spanID string, decorate func(*Span)) *Span {
 	st := fromContext(ctx)
 	if st == nil || !st.sampled || st.rootSpan == nil {
 		return nil
@@ -208,7 +224,13 @@ func AddChildSpan(ctx context.Context, name string, startNs, endNs int64) *Span 
 	if len(st.rawSpans) >= st.maxSpans {
 		return nil
 	}
-	sp := newSpan(st.traceID, NewSpanID(), st.rootSpan.SpanID, name, KindClient, startNs, endNs)
+	if spanID == "" {
+		spanID = NewSpanID()
+	}
+	sp := newSpan(st.traceID, spanID, st.rootSpan.SpanID, name, KindClient, startNs, endNs)
+	if decorate != nil {
+		decorate(sp)
+	}
 	st.rawSpans = append(st.rawSpans, sp)
 	return sp
 }
