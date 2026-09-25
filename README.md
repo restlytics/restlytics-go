@@ -48,6 +48,18 @@ socket, and writes a structured report with `networkRequestMade: false`, the
 post-redaction production payload, configured sampling rate, span count, and
 JSON/gzip byte sizes. Use `RESTLYTICS_SAMPLE_RATE=1` for a deterministic review.
 
+### Outbound HTTP
+
+Wrap the transport used by your application client and derive outbound request
+contexts from the inbound request. The wrapper records a CLIENT span and injects
+that exact span's W3C `traceparent`; unsampled traces still propagate `flags=00`.
+
+```go
+client := &http.Client{Transport: rl.HTTPRoundTripper(http.DefaultTransport)}
+request, _ := http.NewRequestWithContext(r.Context(), http.MethodGet, url, nil)
+response, err := client.Do(request)
+```
+
 ## Delivery reliability and shutdown
 
 `HTTPTransport` owns one worker goroutine and one fixed 64-batch channel shared
