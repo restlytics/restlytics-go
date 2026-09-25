@@ -15,7 +15,7 @@ on:
   # Manual escape hatch: the merge trigger above is the only automatic path, so a
   # release run that fails, is cancelled, or otherwise leaves main untagged cannot
   # be retried without this. Run it from the Actions tab AGAINST MAIN and pick the
-  # bump level; the new version is computed from the latest tag either way.
+  # bump level; ENABLE_PACKAGE_RELEASE must also be true, including for manual runs.
   workflow_dispatch:
     inputs:
       bump:
@@ -35,7 +35,7 @@ concurrency:
 jobs:
   release:
     name: Tag & release
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    if: vars.ENABLE_PACKAGE_RELEASE == 'true' && (github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
